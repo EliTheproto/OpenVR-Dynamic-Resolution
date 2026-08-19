@@ -5,9 +5,9 @@
 
 ![screenshot of the app](screenshot.png)
 
-Lightweight OpenVR app to dynamically adjust your HMD's resolution depending on your GPU frametime, CPU frametime and VRAM.
+Lightweight OpenVR app to dynamically adjust your HMD's resolution depending on your GPU frametime and VRAM.
 
-This allows you to always play at the maximum resolution your GPU can handle while hitting your target FPS (without reprojecting). This is especially useful for games in which performance varies a lot (e.g. VRChat).
+This allows you to always play at the maximum resolution your GPU can handle while hitting your target FPS, with a configurable GPU frametime limit for resolution increases. This is especially useful for games in which performance varies a lot (e.g. VRChat).
 
 This is **not** the same as SteamVR's Auto Resolution, which instead seems to be using a kind of benchmarking approach.
 
