@@ -94,6 +94,7 @@ int minRes = 70;
 int maxRes = 190;
 float resIncreaseThreshold = 79;
 float resDecreaseThreshold = 89;
+float gpuIncreaseLimitMs = 11.0f;
 int resIncreaseMin = 2;
 int resDecreaseMin = 3;
 int resIncreaseScale = 200;
@@ -182,6 +183,7 @@ bool loadSettings()
 		maxRes = std::stoi(ini.GetValue("Resolution", "maxRes", std::to_string(maxRes).c_str()));
 		resIncreaseThreshold = std::stof(ini.GetValue("Resolution", "resIncreaseThreshold", std::to_string(resIncreaseThreshold).c_str()));
 		resDecreaseThreshold = std::stof(ini.GetValue("Resolution", "resDecreaseThreshold", std::to_string(resDecreaseThreshold).c_str()));
+		gpuIncreaseLimitMs = std::stof(ini.GetValue("Resolution", "gpuIncreaseLimitMs", std::to_string(gpuIncreaseLimitMs).c_str()));
 		resIncreaseMin = std::stoi(ini.GetValue("Resolution", "resIncreaseMin", std::to_string(resIncreaseMin).c_str()));
 		resDecreaseMin = std::stoi(ini.GetValue("Resolution", "resDecreaseMin", std::to_string(resDecreaseMin).c_str()));
 		resIncreaseScale = std::stoi(ini.GetValue("Resolution", "resIncreaseScale", std::to_string(resIncreaseScale).c_str()));
@@ -238,6 +240,7 @@ void saveSettings()
 	ini.SetValue("Resolution", "maxRes", std::to_string(maxRes).c_str());
 	ini.SetValue("Resolution", "resIncreaseThreshold", std::to_string(resIncreaseThreshold).c_str());
 	ini.SetValue("Resolution", "resDecreaseThreshold", std::to_string(resDecreaseThreshold).c_str());
+	ini.SetValue("Resolution", "gpuIncreaseLimitMs", std::to_string(gpuIncreaseLimitMs).c_str());
 	ini.SetValue("Resolution", "resIncreaseMin", std::to_string(resIncreaseMin).c_str());
 	ini.SetValue("Resolution", "resDecreaseMin", std::to_string(resDecreaseMin).c_str());
 	ini.SetValue("Resolution", "resIncreaseScale", std::to_string(resIncreaseScale).c_str());
@@ -357,14 +360,14 @@ bool isApplicationWhitelisted(std::string appKey)
 	return appKey != "" && whitelistAppsSet.find(appKey) != whitelistAppsSet.end();
 }
 
-bool shouldAdjustResolution(std::string appKey, bool manualRes, float cpuTime)
+bool shouldAdjustResolution(std::string appKey, bool manualRes)
 {
 	// Check if the SteamVR dashboard is open
 	bool inDashboard = vr::VROverlay()->IsDashboardVisible();
 	// Check that we're in a supported application
 	bool isCurrentAppSupported = !isApplicationBlacklisted(appKey) && (!whitelistEnabled || isApplicationWhitelisted(appKey));
-	// Only adjust resolution if not in dashboard, in a supported application. user didn't pause res and cpu time isn't below threshold
-	return !inDashboard && isCurrentAppSupported && !manualRes && !(resetOnThreshold && cpuTime < minCpuTimeThreshold);
+	// Only adjust resolution if not in dashboard, in a supported application and user didn't pause res
+	return !inDashboard && isCurrentAppSupported && !manualRes;
 }
 
 void printLine(std::string text, long duration)
@@ -667,7 +670,6 @@ int main(int argc, char *argv[])
 	float vramUsedGB = 0;
 	uint32_t hmdWidthRes = 0;
 	uint32_t hmdHeightRes = 0;
-	int resIncreaseThresholdFps = 0;
 	int resDecreaseThresholdFps = 0;
 
 	// GUI variables
@@ -718,12 +720,11 @@ int main(int argc, char *argv[])
 			{
 				hmdHz = displayFrequency;
 				hmdFrametime = 1000.0f / displayFrequency;
-				resIncreaseThresholdFps = std::round(1000.0f / ((resIncreaseThreshold / 100.0f) * hmdFrametime));
 				resDecreaseThresholdFps = std::round(1000.0f / ((resDecreaseThreshold / 100.0f) * hmdFrametime));
 			}
-			targetFpsHigh = resIncreaseThresholdFps;
+			targetFrametimeHigh = std::max(gpuIncreaseLimitMs, 0.1f);
+			targetFpsHigh = std::round(1000.0f / targetFrametimeHigh);
 			targetFpsLow = resDecreaseThresholdFps;
-			targetFrametimeHigh = 1000.0f / resIncreaseThresholdFps;
 			targetFrametimeLow = 1000.0f / resDecreaseThresholdFps;
 
 			// Define totals
@@ -774,26 +775,6 @@ int main(int argc, char *argv[])
 			// Estimated current FPS
 			currentFps = hmdHz / averageFrameShown;
 
-			// Reprojection logic
-			int reprojectEager = averageCpuTime > hmdFrametime;
-			int reprojectNormal = averageCpuTime / 2 > hmdFrametime;
-			int reprojectionCount = 0;
-			if (!ignoreCpuTime)
-			{
-				reprojectionCount = averageCpuTime / hmdFrametime; // floored
-				if (!preferReprojection)
-					reprojectionCount--;
-			}
-			// Scale with alwaysReproject and the const max
-			reprojectionCount = std::min(std::max(std::max(reprojectionCount, 0), alwaysReproject), maxReprojectionCount);
-			if (reprojectionCount > 0)
-			{
-				targetFpsHigh /= reprojectionCount + 1;
-				targetFpsLow /= reprojectionCount + 1;
-				targetFrametimeHigh *= reprojectionCount + 1;
-				targetFrametimeLow *= reprojectionCount + 1;
-			}
-
 			// Get VRAM usage
 			float vramUsed = 0; // Assume we always have free VRAM by default
 			if (nvmlEnabled)
@@ -829,43 +810,40 @@ int main(int argc, char *argv[])
 #pragma region Resolution adjustment
 			// Get the current application key
 			std::string appKey = getCurrentApplicationKey();
-			adjustResolution = shouldAdjustResolution(appKey, manualRes, averageCpuTime);
+			adjustResolution = shouldAdjustResolution(appKey, manualRes);
 			if (adjustResolution)
 			{
 				// Adjust resolution
-				if ((averageCpuTime > minCpuTimeThreshold || vramOnlyMode))
+				// Frametime
+				if (averageGpuTime < targetFrametimeHigh && vramUsed < vramTarget / 100.0f && !vramOnlyMode)
 				{
-					// Frametime
-					if (averageGpuTime < targetFrametimeHigh && vramUsed < vramTarget / 100.0f && !vramOnlyMode)
-					{
-						// Increase resolution
-						newRes += ((targetFrametimeHigh - averageGpuTime) * (resIncreaseScale / 100.0f)) + resIncreaseMin;
-					}
-					else if (averageGpuTime > targetFrametimeLow && !vramOnlyMode)
-					{
-						// Decrease resolution
-						newRes -= ((averageGpuTime - targetFrametimeLow) * (resDecreaseScale / 100.0f)) + resDecreaseMin;
-					}
-
-					// VRAM
-					if (vramUsed > vramLimit / 100.0f)
-					{
-						// Force the resolution to decrease when the vram limit is reached
-						newRes -= resDecreaseMin;
-					}
-					else if (vramOnlyMode && newRes < initialRes && vramUsed < vramTarget / 100.0f)
-					{
-						// When in VRAM-only mode, make sure the res goes back up when possible.
-						newRes = std::min(initialRes, (int)std::round(newRes) + resIncreaseMin);
-					}
-
-					// Clamp the new resolution
-					newRes = std::clamp((int)std::round(newRes), minRes, maxRes);
+					// Increase resolution
+					newRes += ((targetFrametimeHigh - averageGpuTime) * (resIncreaseScale / 100.0f)) + resIncreaseMin;
 				}
+				else if (averageGpuTime > targetFrametimeLow && !vramOnlyMode)
+				{
+					// Decrease resolution
+					newRes -= ((averageGpuTime - targetFrametimeLow) * (resDecreaseScale / 100.0f)) + resDecreaseMin;
+				}
+
+				// VRAM
+				if (vramUsed > vramLimit / 100.0f)
+				{
+					// Force the resolution to decrease when the vram limit is reached
+					newRes -= resDecreaseMin;
+				}
+				else if (vramOnlyMode && newRes < initialRes && vramUsed < vramTarget / 100.0f)
+				{
+					// When in VRAM-only mode, make sure the res goes back up when possible.
+					newRes = std::min(initialRes, (int)std::round(newRes) + resIncreaseMin);
+				}
+
+				// Clamp the new resolution
+				newRes = std::clamp((int)std::round(newRes), minRes, maxRes);
 			}
-			else if ((appKey == "" || (resetOnThreshold && averageCpuTime < minCpuTimeThreshold)) && !manualRes)
+			else if (appKey == "" && !manualRes)
 			{
-				// If (in SteamVR void or cpuTime below threshold) and user didn't pause res
+				// If in SteamVR void and user didn't pause res
 				// Reset to initialRes
 				newRes = initialRes;
 			}
@@ -1008,7 +986,7 @@ int main(int argc, char *argv[])
 			if (pausePressed)
 			{
 				manualRes = !manualRes;
-				adjustResolution = shouldAdjustResolution(getCurrentApplicationKey(), manualRes, averageCpuTime);
+				adjustResolution = shouldAdjustResolution(getCurrentApplicationKey(), manualRes);
 			}
 
 			// Stop creating the main window
@@ -1115,9 +1093,9 @@ int main(int argc, char *argv[])
 
 				if (ImGui::TreeNodeEx("Advanced", ImGuiTreeNodeFlags_NoTreePushOnOpen))
 				{
-					if (ImGui::InputInt("High FPS target", &resIncreaseThresholdFps, 1))
-						resIncreaseThreshold = std::max((float)hmdHz / (float)resIncreaseThresholdFps * 100.0f, 0.0f);
-					addTooltip("When the framerate is higher than this value, resolution is allowed to increase.");
+					if (ImGui::InputFloat("GPU increase limit ms", &gpuIncreaseLimitMs, 0.1f))
+						gpuIncreaseLimitMs = std::max(gpuIncreaseLimitMs, 0.1f);
+					addTooltip("Resolution is allowed to increase while GPU frametime stays below this value.");
 
 					if (ImGui::InputInt("Low FPS target", &resDecreaseThresholdFps, 1))
 						resDecreaseThreshold = std::max((float)hmdHz / (float)resDecreaseThresholdFps * 100.0f, 0.0f);
@@ -1134,26 +1112,12 @@ int main(int argc, char *argv[])
 
 					ImGui::InputInt("Resolution decrease scale", &resDecreaseScale, 10);
 					addTooltip("The more frametime excess and the higher this value is, the more resolution will decrease each time.");
-
-					ImGui::InputFloat("Minimum CPU time threshold", &minCpuTimeThreshold, 0.1);
-					addTooltip("Don't increase resolution if the CPU frametime is below this value (useful to prevent resolution increases during loading screens).");
-
-					ImGui::Checkbox("Reset on CPU time threshold", &resetOnThreshold);
-					addTooltip("Reset the resolution to the initial resolution whenever the \"Minimum CPU time threshold\" is met.");
 				}
 			}
 
 			if (ImGui::CollapsingHeader("Reprojection"))
 			{
-				if (ImGui::InputInt("Minimum reprojection", &alwaysReproject, 1))
-					alwaysReproject = std::clamp(alwaysReproject, 0, maxReprojectionCount);
-				addTooltip("Always scale the target frametime at least according to this factor.");
-
-				ImGui::Checkbox("Prefer reprojection", &preferReprojection);
-				addTooltip("If enabled, scale the target frametime as soon as the CPU frametime is over the initial target frametime. Else, only scale the target frametime if the CPU frametime is over double, triple, etc. the initial target frametime.");
-
-				ImGui::Checkbox("Never reproject", &ignoreCpuTime);
-				addTooltip("Never scale the target frametime depending on the CPU frametime (stops both behaviours described in \"Prefer reprojection\" tooltip; \"Minimum reprojection\" will still work).");
+				ImGui::TextWrapped("Reprojection settings are disabled in GPU-only timing mode.");
 			}
 
 			if (ImGui::CollapsingHeader("VRAM"))
