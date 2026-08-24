@@ -95,11 +95,13 @@ int maxRes = 190;
 float resIncreaseThreshold = 79;
 float resDecreaseThreshold = 89;
 float gpuIncreaseLimitMs = 11.0f;
+bool useHighFrametimeTarget = false;
+float gpuDecreaseLimitMs = 12.5f;
 int resIncreaseMin = 2;
 int resDecreaseMin = 3;
 int resIncreaseScale = 200;
 int resDecreaseScale = 180;
-float minCpuTimeThreshold = 0.6f;
+float minCpuTimeThreshold = 1.0f;
 bool resetOnThreshold = true;
 // Reprojection
 int alwaysReproject = 0;
@@ -184,6 +186,8 @@ bool loadSettings()
 		resIncreaseThreshold = std::stof(ini.GetValue("Resolution", "resIncreaseThreshold", std::to_string(resIncreaseThreshold).c_str()));
 		resDecreaseThreshold = std::stof(ini.GetValue("Resolution", "resDecreaseThreshold", std::to_string(resDecreaseThreshold).c_str()));
 		gpuIncreaseLimitMs = std::stof(ini.GetValue("Resolution", "gpuIncreaseLimitMs", std::to_string(gpuIncreaseLimitMs).c_str()));
+		useHighFrametimeTarget = std::stoi(ini.GetValue("Resolution", "useHighFrametimeTarget", std::to_string(useHighFrametimeTarget).c_str()));
+		gpuDecreaseLimitMs = std::stof(ini.GetValue("Resolution", "gpuDecreaseLimitMs", std::to_string(gpuDecreaseLimitMs).c_str()));
 		resIncreaseMin = std::stoi(ini.GetValue("Resolution", "resIncreaseMin", std::to_string(resIncreaseMin).c_str()));
 		resDecreaseMin = std::stoi(ini.GetValue("Resolution", "resDecreaseMin", std::to_string(resDecreaseMin).c_str()));
 		resIncreaseScale = std::stoi(ini.GetValue("Resolution", "resIncreaseScale", std::to_string(resIncreaseScale).c_str()));
@@ -241,6 +245,8 @@ void saveSettings()
 	ini.SetValue("Resolution", "resIncreaseThreshold", std::to_string(resIncreaseThreshold).c_str());
 	ini.SetValue("Resolution", "resDecreaseThreshold", std::to_string(resDecreaseThreshold).c_str());
 	ini.SetValue("Resolution", "gpuIncreaseLimitMs", std::to_string(gpuIncreaseLimitMs).c_str());
+	ini.SetValue("Resolution", "useHighFrametimeTarget", std::to_string(useHighFrametimeTarget).c_str());
+	ini.SetValue("Resolution", "gpuDecreaseLimitMs", std::to_string(gpuDecreaseLimitMs).c_str());
 	ini.SetValue("Resolution", "resIncreaseMin", std::to_string(resIncreaseMin).c_str());
 	ini.SetValue("Resolution", "resDecreaseMin", std::to_string(resDecreaseMin).c_str());
 	ini.SetValue("Resolution", "resIncreaseScale", std::to_string(resIncreaseScale).c_str());
@@ -720,22 +726,35 @@ int main(int argc, char *argv[])
 			{
 				hmdHz = displayFrequency;
 				hmdFrametime = 1000.0f / displayFrequency;
-				resDecreaseThresholdFps = std::round(1000.0f / ((resDecreaseThreshold / 100.0f) * hmdFrametime));
 			}
 			targetFrametimeHigh = std::max(gpuIncreaseLimitMs, 0.1f);
 			targetFpsHigh = std::round(1000.0f / targetFrametimeHigh);
-			targetFpsLow = resDecreaseThresholdFps;
-			targetFrametimeLow = 1000.0f / resDecreaseThresholdFps;
+			if (useHighFrametimeTarget)
+			{
+				targetFrametimeLow = std::max(gpuDecreaseLimitMs, targetFrametimeHigh + 0.1f);
+				targetFpsLow = std::round(1000.0f / targetFrametimeLow);
+			}
+			else
+			{
+				float lowFpsThresholdFrametime = std::max((resDecreaseThreshold / 100.0f) * hmdFrametime, 0.1f);
+				resDecreaseThresholdFps = std::max((int)std::round(1000.0f / lowFpsThresholdFrametime), 1);
+				targetFpsLow = resDecreaseThresholdFps;
+				targetFrametimeLow = 1000.0f / resDecreaseThresholdFps;
+			}
 
 			// Define totals
 			float totalGpuTime = 0;
 			float totalCpuTime = 0;
 			int frameShownTotal = 0;
+			double minFrameSystemTime = 0.0;
+			double maxFrameSystemTime = 0.0;
+			bool hasFrameSystemTime = false;
 
 			// Loop through past frames
-			frameTiming->m_nSize = sizeof(Compositor_FrameTiming);
-			vr::VRCompositor()->GetFrameTimings(frameTiming, openvrMaxFrames);
 			for (int i = 0; i < openvrMaxFrames; i++)
+				frameTiming[i].m_nSize = sizeof(Compositor_FrameTiming);
+			int frameTimingsCount = vr::VRCompositor()->GetFrameTimings(frameTiming, openvrMaxFrames);
+			for (int i = 0; i < frameTimingsCount; i++)
 			{
 				// Get GPU frametime
 				float gpuTime = frameTiming[i].m_flTotalRenderGpuMs;
@@ -754,12 +773,29 @@ int main(int argc, char *argv[])
 				totalGpuTime += gpuTime;
 				totalCpuTime += std::max(cpuTime, .0f);
 				frameShownTotal += frameShown;
+
+				double frameSystemTime = frameTiming[i].m_flSystemTimeInSeconds;
+				if (frameSystemTime > 0.0)
+				{
+					if (!hasFrameSystemTime)
+					{
+						minFrameSystemTime = frameSystemTime;
+						maxFrameSystemTime = frameSystemTime;
+						hasFrameSystemTime = true;
+					}
+					else
+					{
+						minFrameSystemTime = std::min(minFrameSystemTime, frameSystemTime);
+						maxFrameSystemTime = std::max(maxFrameSystemTime, frameSystemTime);
+					}
+				}
 			}
 
 			// Calculate averages
-			averageGpuTime = totalGpuTime / openvrMaxFrames;
-			averageCpuTime = totalCpuTime / openvrMaxFrames;
-			averageFrameShown = (float)frameShownTotal / (float)openvrMaxFrames;
+			int sampleCount = std::max(frameTimingsCount, 1);
+			averageGpuTime = totalGpuTime / sampleCount;
+			averageCpuTime = totalCpuTime / sampleCount;
+			averageFrameShown = (float)frameShownTotal / (float)sampleCount;
 
 			// Debug override CPU and GPU
 			if (debugEnabled)
@@ -769,11 +805,22 @@ int main(int argc, char *argv[])
 			}
 
 			// GUI
-			gpuFps = std::round(1000.0f / averageGpuTime);
-			cpuFps = std::round(1000.0f / averageCpuTime);
+			gpuFps = averageGpuTime > 0.001f ? std::round(1000.0f / averageGpuTime) : 0;
+			cpuFps = averageCpuTime > 0.001f ? std::round(1000.0f / averageCpuTime) : 0;
 
-			// Estimated current FPS
-			currentFps = hmdHz / averageFrameShown;
+			// Displayed FPS based on compositor frame timing interval
+			if (hasFrameSystemTime && maxFrameSystemTime > minFrameSystemTime)
+			{
+				currentFps = std::round(frameShownTotal / (maxFrameSystemTime - minFrameSystemTime));
+			}
+			else if (averageFrameShown > 0.001f)
+			{
+				currentFps = std::round(hmdHz / averageFrameShown);
+			}
+			else
+			{
+				currentFps = 0;
+			}
 
 			// Get VRAM usage
 			float vramUsed = 0; // Assume we always have free VRAM by default
@@ -814,8 +861,13 @@ int main(int argc, char *argv[])
 			if (adjustResolution)
 			{
 				// Adjust resolution
+				// Optional reset to baseline resolution when CPU frametime is very low
+				if (resetOnThreshold && averageCpuTime < minCpuTimeThreshold && !vramOnlyMode)
+				{
+					newRes = std::clamp(100.0f, (float)minRes, (float)maxRes);
+				}
 				// Frametime
-				if (averageGpuTime < targetFrametimeHigh && vramUsed < vramTarget / 100.0f && !vramOnlyMode)
+				else if (averageGpuTime < targetFrametimeHigh && vramUsed < vramTarget / 100.0f && !vramOnlyMode)
 				{
 					// Increase resolution
 					newRes += ((targetFrametimeHigh - averageGpuTime) * (resIncreaseScale / 100.0f)) + resIncreaseMin;
@@ -900,7 +952,7 @@ int main(int argc, char *argv[])
 			// Target FPS and frametime
 			if (!vramOnlyMode)
 			{
-				ImGui::Text("%s", fmt::format("Target FPS: {}-{} fps ({:.2f}-{:.2f} ms)", targetFpsLow, targetFpsHigh, targetFrametimeLow, targetFrametimeHigh).c_str());
+				ImGui::Text("%s", fmt::format("Target window: {}-{} fps ({:.2f}-{:.2f} ms)", targetFpsLow, targetFpsHigh, targetFrametimeLow, targetFrametimeHigh).c_str());
 			}
 			else
 			{
@@ -1097,9 +1149,31 @@ int main(int argc, char *argv[])
 						gpuIncreaseLimitMs = std::max(gpuIncreaseLimitMs, 0.1f);
 					addTooltip("Resolution is allowed to increase while GPU frametime stays below this value.");
 
-					if (ImGui::InputInt("Low FPS target", &resDecreaseThresholdFps, 1))
-						resDecreaseThreshold = std::max((float)hmdHz / (float)resDecreaseThresholdFps * 100.0f, 0.0f);
-					addTooltip("When the framerate is lower than this value, resolution starts decreasing.");
+					ImGui::Checkbox("Use high frametime target", &useHighFrametimeTarget);
+					addTooltip("Use a fixed GPU frametime threshold to start decreasing resolution instead of a low FPS target.");
+
+					if (useHighFrametimeTarget)
+					{
+						if (ImGui::InputFloat("GPU decrease limit ms", &gpuDecreaseLimitMs, 0.1f))
+							gpuDecreaseLimitMs = std::max(gpuDecreaseLimitMs, 0.1f);
+						addTooltip("When GPU frametime exceeds this value, resolution starts decreasing.");
+					}
+					else
+					{
+						if (ImGui::InputInt("Low FPS target", &resDecreaseThresholdFps, 1))
+						{
+							resDecreaseThresholdFps = std::max(resDecreaseThresholdFps, 1);
+							resDecreaseThreshold = std::max((float)hmdHz / (float)resDecreaseThresholdFps * 100.0f, 0.0f);
+						}
+						addTooltip("When displayed FPS falls below this value, resolution starts decreasing.");
+					}
+
+					ImGui::Checkbox("Reset to 100% on low CPU frametime", &resetOnThreshold);
+					addTooltip("Reset resolution back to 100% when CPU frametime drops below the threshold.");
+
+					if (ImGui::InputFloat("CPU frametime reset threshold ms", &minCpuTimeThreshold, 0.1f))
+						minCpuTimeThreshold = std::max(minCpuTimeThreshold, 0.1f);
+					addTooltip("CPU frametime threshold used for reset-to-100% behavior.");
 
 					ImGui::InputInt("Resolution increase constant", &resIncreaseMin, 1);
 					addTooltip("Constant percentages to increase resolution when available.");
