@@ -4,6 +4,7 @@
 #include <thread>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 
 // OpenVR to interact with VR
@@ -706,9 +707,10 @@ int main(int argc, char *argv[])
 
 #pragma region Getting data
 			float currentRes = vr::VRSettings()->GetFloat(vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_SupersampleScale_Float) * 100.0f;
+			int currentResInt = (int)std::round(currentRes);
 
 			// Check for external resolution change (if resolution got changed and it wasn't us)
-			if (externalResChangeCompatibility && std::fabs(newRes - currentRes) > 0.001f && !manualRes)
+			if (externalResChangeCompatibility && currentResInt != (int)std::round(newRes) && !manualRes)
 				manualRes = true;
 
 			// Check for end of external resolution change (if automatic resolution is enabled)
@@ -719,8 +721,8 @@ int main(int argc, char *argv[])
 			}
 
 			// Fetch resolution and target fps
-			newRes = currentRes;
-			float lastRes = newRes;
+			newRes = (float)currentResInt;
+			int lastRes = currentResInt;
 			int displayFrequency = std::round(vr::VRSystem()->GetFloatTrackedDeviceProperty(0, Prop_DisplayFrequency_Float));
 			if (hmdHz != displayFrequency)
 			{
@@ -746,6 +748,7 @@ int main(int argc, char *argv[])
 			float totalGpuTime = 0;
 			float totalCpuTime = 0;
 			int frameShownTotal = 0;
+			int validTimingSamples = 0;
 			double minFrameSystemTime = 0.0;
 			double maxFrameSystemTime = 0.0;
 			bool hasFrameSystemTime = false;
@@ -763,16 +766,17 @@ int main(int argc, char *argv[])
 				// https://github.com/Louka3000/OpenVR-Dynamic-Resolution/issues/18#issuecomment-1833105172
 				float cpuTime = frameTiming[i].m_flCompositorRenderCpuMs									 // Compositor
 								+ (frameTiming[i].m_flNewFrameReadyMs - frameTiming[i].m_flNewPosesReadyMs); // Application & Late Start
+				if (!std::isfinite(gpuTime) || !std::isfinite(cpuTime) || gpuTime <= 0.0f)
+					continue;
 
 				// How many times the current frame repeated (>1 = reprojecting)
 				int frameShown = std::max((int)frameTiming[i].m_nNumFramePresents, 1);
-				// Reason reprojection is happening
-				int reprojectionFlag = frameTiming[i].m_nReprojectionFlags;
 
 				// Add to totals
 				totalGpuTime += gpuTime;
 				totalCpuTime += std::max(cpuTime, .0f);
 				frameShownTotal += frameShown;
+				validTimingSamples++;
 
 				double frameSystemTime = frameTiming[i].m_flSystemTimeInSeconds;
 				if (frameSystemTime > 0.0)
@@ -792,16 +796,26 @@ int main(int argc, char *argv[])
 			}
 
 			// Calculate averages
-			int sampleCount = std::max(frameTimingsCount, 1);
-			averageGpuTime = totalGpuTime / sampleCount;
-			averageCpuTime = totalCpuTime / sampleCount;
-			averageFrameShown = (float)frameShownTotal / (float)sampleCount;
+			if (validTimingSamples > 0)
+			{
+				averageGpuTime = totalGpuTime / validTimingSamples;
+				averageCpuTime = totalCpuTime / validTimingSamples;
+				averageFrameShown = (float)frameShownTotal / (float)validTimingSamples;
+			}
+			else
+			{
+				averageGpuTime = 0.0f;
+				averageCpuTime = 0.0f;
+				averageFrameShown = 0.0f;
+			}
+			bool hasValidFrametimeData = validTimingSamples > 0;
 
 			// Debug override CPU and GPU
 			if (debugEnabled)
 			{
 				averageGpuTime = debugGpuFrametime;
 				averageCpuTime = debugCpuFrametime;
+				hasValidFrametimeData = true;
 			}
 
 			// GUI
@@ -862,17 +876,17 @@ int main(int argc, char *argv[])
 			{
 				// Adjust resolution
 				// Optional reset to baseline resolution when CPU frametime is very low
-				if (resetOnThreshold && averageCpuTime < minCpuTimeThreshold && !vramOnlyMode)
+				if (resetOnThreshold && hasValidFrametimeData && averageCpuTime < minCpuTimeThreshold && !vramOnlyMode)
 				{
 					newRes = std::clamp(100.0f, (float)minRes, (float)maxRes);
 				}
 				// Frametime
-				else if (averageGpuTime < targetFrametimeHigh && vramUsed < vramTarget / 100.0f && !vramOnlyMode)
+				else if (hasValidFrametimeData && averageGpuTime < targetFrametimeHigh && vramUsed < vramTarget / 100.0f && !vramOnlyMode)
 				{
 					// Increase resolution
 					newRes += ((targetFrametimeHigh - averageGpuTime) * (resIncreaseScale / 100.0f)) + resIncreaseMin;
 				}
-				else if (averageGpuTime > targetFrametimeLow && !vramOnlyMode)
+				else if (hasValidFrametimeData && averageGpuTime > targetFrametimeLow && !vramOnlyMode)
 				{
 					// Decrease resolution
 					newRes -= ((averageGpuTime - targetFrametimeLow) * (resDecreaseScale / 100.0f)) + resDecreaseMin;
@@ -900,10 +914,12 @@ int main(int argc, char *argv[])
 				newRes = initialRes;
 			}
 
-			if (newRes != lastRes)
+			int newResInt = std::clamp((int)std::round(newRes), minRes, maxRes);
+			newRes = (float)newResInt;
+			if (newResInt != lastRes && newResInt != currentResInt)
 			{
 				// Sets the new resolution
-				vr::VRSettings()->SetFloat(vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_SupersampleScale_Float, newRes / 100.0f);
+				vr::VRSettings()->SetFloat(vr::k_pch_SteamVR_Section, vr::k_pch_SteamVR_SupersampleScale_Float, newResInt / 100.0f);
 			}
 
 			vr::VRSystem()->GetRecommendedRenderTargetSize(&hmdWidthRes, &hmdHeightRes);
